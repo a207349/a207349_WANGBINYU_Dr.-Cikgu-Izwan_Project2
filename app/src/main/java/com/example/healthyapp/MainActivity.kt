@@ -1,5 +1,6 @@
 package com.example.healthyapp
 
+import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -9,44 +10,16 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn // 【新增】用于历史记录列表
-import androidx.compose.foundation.lazy.items // 【新增】用于历史记录列表项
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.State
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf // 【新增】用于保存列表状态
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -57,41 +30,35 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import java.text.SimpleDateFormat // 【新增】用于时间格式化
-import java.util.Date // 【新增】用于获取当前时间
-import java.util.Locale // 【新增】
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-import com.example.healthyapp.R
+// ⚠️ 核心导入：引入我们刚刚拆分出去的 data 包组件
+import com.example.healthyapp.data.WaterRecord
+import com.example.healthyapp.data.WaterDao
+import com.example.healthyapp.data.HealthDatabase
+import com.example.healthyapp.data.HealthRepository
 import com.example.healthyapp.ui.theme.HealthyAPPTheme
 
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            HealthyAPPTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    HealthApp()
-                }
-            }
-        }
-    }
-}
-
+// ==========================================
+// 5. ViewModel 及 Factory (视图模型层)
+// ==========================================
 data class HealthProfile(
     val userName: String = "WANGBINYU",
-    val studentId: String = "a123456",
+    val studentId: String = "a207349",
     val waterIntake: Int = 0,
     val dailyGoal: Int = 2000,
     val steps: Int = 432,
@@ -99,13 +66,22 @@ data class HealthProfile(
     val sleepQuality: Int = 85
 )
 
-class HealthViewModel : ViewModel() {
+class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
     private val _uiState = mutableStateOf(HealthProfile())
     val uiState: State<HealthProfile> = _uiState
 
-    // 【新增】使用 mutableStateListOf 来保存历史记录列表
-    private val _waterHistory = mutableStateListOf<String>()
-    val waterHistory: List<String> get() = _waterHistory
+    // 暴露给 UI 的数据流
+    val waterHistory: Flow<List<WaterRecord>> = repository.allRecords
+
+    init {
+        // 自动计算总饮水量：实时监听数据库中的所有记录，求和后更新 UI 状态
+        viewModelScope.launch {
+            repository.allRecords.collect { records ->
+                val totalIntake = records.sumOf { it.amount }
+                _uiState.value = _uiState.value.copy(waterIntake = totalIntake)
+            }
+        }
+    }
 
     fun updateProfile(name: String, id: String, goal: Int) {
         _uiState.value = _uiState.value.copy(
@@ -117,59 +93,82 @@ class HealthViewModel : ViewModel() {
 
     fun addWater(amount: Int) {
         if (amount > 0) {
-            _uiState.value = _uiState.value.copy(
-                waterIntake = _uiState.value.waterIntake + amount
-            )
-            // 【新增】每次加水时，记录一条带有时间的历史
             val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-            _waterHistory.add("Added $amount ml (Time: $time)")
+            val message = "Added $amount ml (Time: $time)"
+
+            // 使用协程将数据异步写入 Room 数据库
+            viewModelScope.launch {
+                repository.insert(WaterRecord(amount = amount, logMessage = message))
+            }
         }
     }
 }
 
-// 【修改】定义 5 个页面 route 满足指南要求
+class HealthViewModelFactory(private val repository: HealthRepository) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(HealthViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return HealthViewModel(repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}
+
+// ==========================================
+// MainActivity (主 Activity 入口)
+// ==========================================
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // 初始化 Room 数据库和 Repository
+        val database = HealthDatabase.getDatabase(applicationContext)
+        val repository = HealthRepository(database.waterDao())
+        val viewModelFactory = HealthViewModelFactory(repository)
+
+        setContent {
+            HealthyAPPTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    HealthApp(factory = viewModelFactory)
+                }
+            }
+        }
+    }
+}
+
 sealed class Screen(val route: String) {
     data object Dashboard : Screen("dashboard")
     data object Input : Screen("input")
     data object Detail : Screen("detail")
-    data object History : Screen("history")   // 【新增】第 4 个页面
-    data object SdgInfo : Screen("sdg_info")  // 【新增】第 5 个页面
+    data object History : Screen("history")
+    data object SdgInfo : Screen("sdg_info")
 }
 
 @Composable
-fun HealthApp(
-    healthViewModel: HealthViewModel = viewModel()
-) {
+fun HealthApp(factory: ViewModelProvider.Factory) {
+    val healthViewModel: HealthViewModel = viewModel(factory = factory)
     val navController = rememberNavController()
 
     NavHost(
         navController = navController,
         startDestination = Screen.Dashboard.route
     ) {
-        composable(Screen.Dashboard.route) {
-            DashboardScreen(navController, healthViewModel)
-        }
-        composable(Screen.Input.route) {
-            InputScreen(navController, healthViewModel)
-        }
-        composable(Screen.Detail.route) {
-            DetailScreen(navController, healthViewModel)
-        }
-        // 【新增】注册第 4 和 第 5 个页面
-        composable(Screen.History.route) {
-            HistoryScreen(navController, healthViewModel)
-        }
-        composable(Screen.SdgInfo.route) {
-            SdgInfoScreen(navController)
-        }
+        composable(Screen.Dashboard.route) { DashboardScreen(navController, healthViewModel) }
+        composable(Screen.Input.route) { InputScreen(navController, healthViewModel) }
+        composable(Screen.Detail.route) { DetailScreen(navController, healthViewModel) }
+        composable(Screen.History.route) { HistoryScreen(navController, healthViewModel) }
+        composable(Screen.SdgInfo.route) { SdgInfoScreen(navController) }
     }
 }
 
+// ==========================================
+// UI 页面组件
+// ==========================================
 @Composable
-fun DashboardScreen(
-    navController: NavHostController,
-    healthViewModel: HealthViewModel
-) {
+fun DashboardScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
     val uiState = healthViewModel.uiState.value
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -257,9 +256,7 @@ fun DashboardScreen(
                         textColor = Color(0xFF0B3D91)
                     )
                 }
-
                 Spacer(modifier = Modifier.width(16.dp))
-
                 Box(modifier = Modifier.weight(1f)) {
                     DashboardCard(
                         title = "Heart Rate",
@@ -289,9 +286,7 @@ fun DashboardScreen(
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                ),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                 elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
                 shape = RoundedCornerShape(24.dp)
             ) {
@@ -339,18 +334,14 @@ fun DashboardScreen(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // 【新增】第 5 个页面入口：关于 SDG
             Button(
                 onClick = { navController.navigate(Screen.SdgInfo.route) },
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.tertiary
-                )
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
             ) {
                 Text("About SDG 3 (Health & Well-being)")
             }
-
             Spacer(modifier = Modifier.height(32.dp))
         }
 
@@ -371,12 +362,8 @@ fun DashboardScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun InputScreen(
-    navController: NavHostController,
-    healthViewModel: HealthViewModel
-) {
+fun InputScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
     val uiState = healthViewModel.uiState.value
-
     var name by remember { mutableStateOf(uiState.userName) }
     var studentId by remember { mutableStateOf(uiState.studentId) }
     var goalText by remember { mutableStateOf(uiState.dailyGoal.toString()) }
@@ -386,9 +373,7 @@ fun InputScreen(
         topBar = {
             TopAppBar(
                 title = { Text("Update Health Profile") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
             )
         }
     ) { innerPadding ->
@@ -400,72 +385,45 @@ fun InputScreen(
                 .verticalScroll(rememberScrollState())
         ) {
             OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                label = { Text("User Name") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                value = name, onValueChange = { name = it }, label = { Text("User Name") },
+                modifier = Modifier.fillMaxWidth(), singleLine = true
             )
-
             Spacer(modifier = Modifier.height(16.dp))
-
             OutlinedTextField(
-                value = studentId,
-                onValueChange = { studentId = it },
-                label = { Text("Student ID") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                value = studentId, onValueChange = { studentId = it }, label = { Text("Student ID") },
+                modifier = Modifier.fillMaxWidth(), singleLine = true
             )
-
             Spacer(modifier = Modifier.height(16.dp))
-
             OutlinedTextField(
-                value = goalText,
-                onValueChange = { goalText = it },
-                label = { Text("Daily Water Goal (ml)") },
+                value = goalText, onValueChange = { goalText = it }, label = { Text("Daily Water Goal (ml)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                modifier = Modifier.fillMaxWidth(), singleLine = true
             )
-
             Spacer(modifier = Modifier.height(16.dp))
-
             OutlinedTextField(
-                value = waterText,
-                onValueChange = { waterText = it },
-                label = { Text("Add Water Intake (ml)") },
+                value = waterText, onValueChange = { waterText = it }, label = { Text("Add Water Intake (ml)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
+                modifier = Modifier.fillMaxWidth(), singleLine = true
             )
-
             Spacer(modifier = Modifier.height(24.dp))
 
             Button(
                 onClick = {
                     val goal = goalText.toIntOrNull() ?: uiState.dailyGoal
                     val water = waterText.toIntOrNull() ?: 0
-
                     healthViewModel.updateProfile(name, studentId, goal)
                     healthViewModel.addWater(water)
-
                     navController.navigate(Screen.Detail.route)
                 },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp)
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
             ) {
                 Text("Save and Continue")
             }
-
             Spacer(modifier = Modifier.height(12.dp))
-
             Button(
                 onClick = { navController.navigate(Screen.Dashboard.route) },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.secondary
-                )
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
             ) {
                 Text("Back to Dashboard")
             }
@@ -475,10 +433,7 @@ fun InputScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(
-    navController: NavHostController,
-    healthViewModel: HealthViewModel
-) {
+fun DetailScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
     val uiState = healthViewModel.uiState.value
     val remaining = (uiState.dailyGoal - uiState.waterIntake).coerceAtLeast(0)
 
@@ -486,9 +441,7 @@ fun DetailScreen(
         topBar = {
             TopAppBar(
                 title = { Text("Health Summary") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.tertiaryContainer
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
             )
         }
     ) { innerPadding ->
@@ -501,46 +454,31 @@ fun DetailScreen(
         ) {
             SummaryCard("User Name", uiState.userName)
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Student ID", uiState.studentId)
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Water Intake", "${uiState.waterIntake} ml")
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Daily Goal", "${uiState.dailyGoal} ml")
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Remaining to Goal", "$remaining ml")
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Heart Rate", "${uiState.heartRate} bpm")
             Spacer(modifier = Modifier.height(12.dp))
-
             SummaryCard("Sleep Quality", "${uiState.sleepQuality}%")
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 【新增】第 4 个页面入口：查看饮水历史
             Button(
                 onClick = { navController.navigate(Screen.History.route) },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary
-                )
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
                 Text("View Water Intake History")
             }
-
             Spacer(modifier = Modifier.height(12.dp))
-
             Button(
                 onClick = { navController.navigate(Screen.Dashboard.route) },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.secondary
-                )
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
             ) {
                 Text("Back to Dashboard")
             }
@@ -548,24 +486,16 @@ fun DetailScreen(
     }
 }
 
-// ==========================================
-// 【新增】第 4 个页面：历史记录列表页
-// ==========================================
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HistoryScreen(
-    navController: NavHostController,
-    healthViewModel: HealthViewModel
-) {
-    val historyList = healthViewModel.waterHistory
+fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
+    val historyList by healthViewModel.waterHistory.collectAsState(initial = emptyList())
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Water Intake History") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.primaryContainer
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
             )
         }
     ) { innerPadding ->
@@ -588,12 +518,10 @@ fun HistoryScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 8.dp),
-                            colors = CardDefaults.cardColors(
-                                containerColor = MaterialTheme.colorScheme.surfaceVariant
-                            )
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                         ) {
                             Text(
-                                text = "💧 $record",
+                                text = "💧 ${record.logMessage}",
                                 modifier = Modifier.padding(16.dp),
                                 fontWeight = FontWeight.Medium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -602,13 +530,10 @@ fun HistoryScreen(
                     }
                 }
             }
-
             Spacer(modifier = Modifier.height(16.dp))
-
             Button(
                 onClick = { navController.popBackStack() },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp)
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
             ) {
                 Text("Back")
             }
@@ -616,9 +541,6 @@ fun HistoryScreen(
     }
 }
 
-// ==========================================
-// 【新增】第 5 个页面：SDG 目标介绍页
-// ==========================================
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SdgInfoScreen(navController: NavHostController) {
@@ -626,9 +548,7 @@ fun SdgInfoScreen(navController: NavHostController) {
         topBar = {
             TopAppBar(
                 title = { Text("SDG 3 Impact") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color(0xFFC8E6C9) // 浅绿色背景匹配 SDG3
-                )
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFFC8E6C9))
             )
         }
     ) { innerPadding ->
@@ -639,28 +559,11 @@ fun SdgInfoScreen(navController: NavHostController) {
                 .padding(24.dp)
                 .verticalScroll(rememberScrollState())
         ) {
-            Text(
-                text = "Sustainable Development Goal 3",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF2E7D32)
-            )
-
+            Text(text = "Sustainable Development Goal 3", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
             Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "Good Health and Well-being",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
-            )
-
+            Text(text = "Good Health and Well-being", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = "Ensure healthy lives and promote well-being for all at all ages.",
-                style = MaterialTheme.typography.bodyLarge,
-            )
-
+            Text(text = "Ensure healthy lives and promote well-being for all at all ages.", style = MaterialTheme.typography.bodyLarge)
             Spacer(modifier = Modifier.height(24.dp))
 
             Card(
@@ -669,25 +572,15 @@ fun SdgInfoScreen(navController: NavHostController) {
                 shape = RoundedCornerShape(16.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "App Impact Statement:",
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF1B5E20)
-                    )
+                    Text(text = "App Impact Statement:", fontWeight = FontWeight.Bold, color = Color(0xFF1B5E20))
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Proper hydration and health metric tracking can significantly prevent illnesses, improve daily energy levels, and encourage a healthier community lifestyle.",
-                        color = Color(0xFF2E7D32)
-                    )
+                    Text(text = "Proper hydration and health metric tracking can significantly prevent illnesses, improve daily energy levels, and encourage a healthier community lifestyle.", color = Color(0xFF2E7D32))
                 }
             }
-
             Spacer(modifier = Modifier.weight(1f))
-
             Button(
                 onClick = { navController.popBackStack() },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
             ) {
                 Text("Back to Dashboard")
@@ -696,19 +589,11 @@ fun SdgInfoScreen(navController: NavHostController) {
     }
 }
 
-
 @Composable
-fun WaterTrackerCard(
-    totalWater: Int,
-    dailyGoal: Int,
-    onAddWaterClick: () -> Unit
-) {
+fun WaterTrackerCard(totalWater: Int, dailyGoal: Int, onAddWaterClick: () -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.secondaryContainer
-        ),
+        modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
@@ -716,28 +601,12 @@ fun WaterTrackerCard(
                 Text(text = "💧", fontSize = 24.sp)
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
-                    Text(
-                        text = "Water Intake",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSecondaryContainer
-                    )
-                    Text(
-                        text = "Today: $totalWater ml / Goal: $dailyGoal ml",
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Text(text = "Water Intake", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                    Text(text = "Today: $totalWater ml / Goal: $dailyGoal ml", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                 }
             }
-
             Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-                onClick = onAddWaterClick,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
-            ) {
+            Button(onClick = onAddWaterClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
                 Text("Go to Input Screen")
             }
         }
@@ -745,27 +614,13 @@ fun WaterTrackerCard(
 }
 
 @Composable
-fun DashboardCard(
-    title: String,
-    icon: String,
-    value: String,
-    unit: String,
-    detailText: String,
-    bgColor: Color,
-    textColor: Color
-) {
+fun DashboardCard(title: String, icon: String, value: String, unit: String, detailText: String, bgColor: Color, textColor: Color) {
     var expanded by remember { mutableStateOf(false) }
-
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .animateContentSize(
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioNoBouncy,
-                    stiffness = Spring.StiffnessMedium
-                )
-            )
+            .animateContentSize(animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMedium))
             .clickable { expanded = !expanded },
         colors = CardDefaults.cardColors(containerColor = bgColor),
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
@@ -775,45 +630,21 @@ fun DashboardCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(text = icon, fontSize = 20.sp)
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = title,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = textColor
-                )
+                Text(text = title, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = textColor)
             }
-
             Spacer(modifier = Modifier.height(12.dp))
-
             Row(verticalAlignment = Alignment.Bottom) {
-                Text(
-                    text = value,
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = textColor
-                )
+                Text(text = value, fontSize = 36.sp, fontWeight = FontWeight.ExtraBold, color = textColor)
                 Spacer(modifier = Modifier.width(4.dp))
                 if (unit.isNotEmpty()) {
-                    Text(
-                        text = unit,
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = textColor.copy(alpha = 0.8f),
-                        modifier = Modifier.padding(bottom = 6.dp)
-                    )
+                    Text(text = unit, fontSize = 16.sp, fontWeight = FontWeight.Medium, color = textColor.copy(alpha = 0.8f), modifier = Modifier.padding(bottom = 6.dp))
                 }
             }
-
             if (expanded) {
                 Spacer(modifier = Modifier.height(16.dp))
                 HorizontalDivider(color = textColor.copy(alpha = 0.2f))
                 Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = detailText,
-                    fontSize = 14.sp,
-                    color = textColor,
-                    lineHeight = 20.sp
-                )
+                Text(text = detailText, fontSize = 14.sp, color = textColor, lineHeight = 20.sp)
             }
         }
     }
@@ -822,25 +653,13 @@ fun DashboardCard(
 @Composable
 fun SummaryCard(label: String, value: String) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer
-        )
+        modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
-            )
+            Text(text = label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onPrimaryContainer)
             Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = value,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
-            )
+            Text(text = value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
         }
     }
 }
@@ -858,23 +677,6 @@ fun BottomNavIcon(label: String, imageResId: Int, isSelected: Boolean) {
                 .alpha(if (isSelected) 1f else 0.4f)
         )
         Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            color = if (isSelected) {
-                MaterialTheme.colorScheme.primary
-            } else {
-                MaterialTheme.colorScheme.onSurfaceVariant
-            },
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium
-        )
-    }
-}
-
-@Preview(showBackground = true)
-@Composable
-fun DashboardPreview() {
-    HealthyAPPTheme {
-        HealthApp()
+        Text(text = label, fontSize = 12.sp, color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium)
     }
 }
