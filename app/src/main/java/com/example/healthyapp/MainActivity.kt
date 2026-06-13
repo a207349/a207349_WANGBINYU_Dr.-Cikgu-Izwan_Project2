@@ -1,6 +1,10 @@
 package com.example.healthyapp
 
 import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -35,13 +39,16 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
+import kotlin.math.sqrt
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -51,6 +58,10 @@ import com.example.healthyapp.data.WaterRecord
 import com.example.healthyapp.data.WaterDao
 import com.example.healthyapp.data.HealthDatabase
 import com.example.healthyapp.data.HealthRepository
+import com.example.healthyapp.firebase.CommunityPost
+import com.example.healthyapp.firebase.FirestoreService
+import com.example.healthyapp.network.HealthyApiClient
+import com.example.healthyapp.network.WaterLogItem
 import com.example.healthyapp.ui.theme.HealthyAPPTheme
 
 // ==========================================
@@ -59,6 +70,9 @@ import com.example.healthyapp.ui.theme.HealthyAPPTheme
 data class HealthProfile(
     val userName: String = "WANGBINYU",
     val studentId: String = "a207349",
+    val age: Int = 20,
+    val heightCm: Int = 182,
+    val weightKg: Int = 92,
     val waterIntake: Int = 0,
     val dailyGoal: Int = 2000,
     val steps: Int = 432,
@@ -69,11 +83,23 @@ data class HealthProfile(
 class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
     private val _uiState = mutableStateOf(HealthProfile())
     val uiState: State<HealthProfile> = _uiState
+    var healthTip by mutableStateOf("Tap Refresh to get a healthy quote.")
+        private set
+    var errorMessage by mutableStateOf<String?>(null)
+        private set
 
-    // 暴露给 UI 的数据流
+    // 暴露给 UI 的数据流（Room 本地）
     val waterHistory: Flow<List<WaterRecord>> = repository.allRecords
 
+    // 服务端饮水记录
+    var serverHistory by mutableStateOf<List<WaterLogItem>>(emptyList())
+        private set
+    var isHistoryLoading by mutableStateOf(false)
+        private set
+
     init {
+        // 从服务器加载个人资料
+        loadProfileFromServer()
         // 自动计算总饮水量：实时监听数据库中的所有记录，求和后更新 UI 状态
         viewModelScope.launch {
             repository.allRecords.collect { records ->
@@ -83,12 +109,100 @@ class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
         }
     }
 
-    fun updateProfile(name: String, id: String, goal: Int) {
+    fun loadWaterHistoryFromServer() {
+        viewModelScope.launch {
+            isHistoryLoading = true
+            try {
+                val response = HealthyApiClient.api.getWaterHistory(studentId = _uiState.value.studentId)
+                if (response.success && response.items != null) {
+                    serverHistory = response.items
+                }
+            } catch (_: Exception) {
+                // 保留上次数据
+            }
+            isHistoryLoading = false
+        }
+    }
+
+    private val firestoreService = FirestoreService()
+    private var firestoreListener: com.google.firebase.firestore.ListenerRegistration? = null
+
+    var communityPosts by mutableStateOf<List<CommunityPost>>(emptyList())
+        private set
+    var isPosting by mutableStateOf(false)
+        private set
+
+    init {
+        firestoreListener = firestoreService.listenPosts { posts ->
+            communityPosts = posts
+        }
+    }
+
+    fun addCommunityPost(studentId: String, tipText: String, source: String) {
+        viewModelScope.launch {
+            isPosting = true
+            try {
+                firestoreService.addPost(studentId, tipText, source)
+            } catch (_: Exception) {
+                errorMessage = "Failed to post"
+            }
+            isPosting = false
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        firestoreListener?.remove()
+    }
+
+    private fun loadProfileFromServer() {
+        viewModelScope.launch {
+            try {
+                val response = HealthyApiClient.api.getProfile(studentId = _uiState.value.studentId)
+                if (response.success && response.profile != null) {
+                    val p = response.profile
+                    _uiState.value = _uiState.value.copy(
+                        userName = p.userName,
+                        studentId = p.studentId,
+                        age = p.age,
+                        heightCm = p.heightCm,
+                        weightKg = p.weightKg,
+                        dailyGoal = p.dailyWaterGoalMl
+                    )
+                }
+            } catch (_: Exception) {
+                // 服务器不可用时静默使用本地默认值
+            }
+        }
+    }
+
+    fun updateProfile(name: String, id: String, age: Int, heightCm: Int, weightKg: Int, goal: Int) {
         _uiState.value = _uiState.value.copy(
             userName = name,
             studentId = id,
+            age = age,
+            heightCm = heightCm,
+            weightKg = weightKg,
             dailyGoal = goal
         )
+        // 同步到服务器
+        viewModelScope.launch {
+            try {
+                val response = HealthyApiClient.api.saveProfile(
+                    userName = name,
+                    studentId = id,
+                    age = age,
+                    heightCm = heightCm,
+                    weightKg = weightKg,
+                    dailyGoal = goal
+                )
+                if (!response.success) {
+                    errorMessage = response.message ?: response.error ?: "Failed to save profile"
+                }
+            } catch (_: Exception) {
+                errorMessage = "Server is offline, profile saved locally"
+            }
+        }
     }
 
     fun addWater(amount: Int) {
@@ -96,11 +210,47 @@ class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
             val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
             val message = "Added $amount ml (Time: $time)"
 
-            // 使用协程将数据异步写入 Room 数据库
             viewModelScope.launch {
+                // 写入 Room 数据库
                 repository.insert(WaterRecord(amount = amount, logMessage = message))
             }
+            // 同步到服务器
+            viewModelScope.launch {
+                try {
+                    val response = HealthyApiClient.api.addWater(
+                        studentId = _uiState.value.studentId,
+                        amountMl = amount,
+                        note = message
+                    )
+                    if (!response.success) {
+                        errorMessage = response.message ?: response.error ?: "Failed to sync water"
+                    }
+                } catch (_: Exception) {
+                    errorMessage = "Server is offline, water saved locally"
+                }
+            }
         }
+    }
+    fun refreshHealthTip() {
+        healthTip = randomLocalTip()
+    }
+
+    private fun randomLocalTip(): String {
+        val fallbackTips = listOf(
+            "Drink at least 8 glasses of water daily for optimal hydration.",
+            "A 20-minute walk can boost your mood and energy levels.",
+            "Sleep 7-9 hours per night to support overall health.",
+            "Eating a balanced diet rich in fruits and vegetables strengthens your immune system.",
+            "Stay hydrated — even mild dehydration can cause fatigue and headaches.",
+            "Regular exercise reduces the risk of chronic diseases.",
+            "Taking deep breaths for 2 minutes can lower stress levels.",
+            "Limit screen time 30 minutes before bed for better sleep quality.",
+            "Stretching daily improves flexibility and reduces injury risk.",
+            "Drinking water before meals can aid digestion and portion control.",
+            "Good posture reduces back and neck pain.",
+            "Spending time outdoors boosts vitamin D and mental well-being."
+        )
+        return "\"${fallbackTips.random()}\""
     }
 }
 
@@ -117,14 +267,23 @@ class HealthViewModelFactory(private val repository: HealthRepository) : ViewMod
 // ==========================================
 // MainActivity (主 Activity 入口)
 // ==========================================
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), SensorEventListener {
+    private lateinit var sensorManager: SensorManager
+    private var accelerometer: Sensor? = null
+    private var lastShakeTime = 0L
+
+    private lateinit var viewModel: HealthViewModel
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 初始化 Room 数据库和 Repository
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
         val database = HealthDatabase.getDatabase(applicationContext)
         val repository = HealthRepository(database.waterDao())
-        val viewModelFactory = HealthViewModelFactory(repository)
+        val factory = HealthViewModelFactory(repository)
+        viewModel = ViewModelProvider(this, factory)[HealthViewModel::class.java]
 
         setContent {
             HealthyAPPTheme {
@@ -132,8 +291,37 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    HealthApp(factory = viewModelFactory)
+                    HealthApp(viewModel = viewModel)
                 }
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        accelerometer?.also { accel ->
+            sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_UI)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        event ?: return
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+        val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+        if (magnitude > SensorManager.GRAVITY_EARTH + 15f) {
+            val now = System.currentTimeMillis()
+            if (now - lastShakeTime > 2000) {
+                lastShakeTime = now
+                viewModel.addWater(100)
             }
         }
     }
@@ -142,25 +330,30 @@ class MainActivity : ComponentActivity() {
 sealed class Screen(val route: String) {
     data object Dashboard : Screen("dashboard")
     data object Input : Screen("input")
+    data object Tips : Screen("tips")
     data object Detail : Screen("detail")
+    data object Me : Screen("me")
     data object History : Screen("history")
-    data object SdgInfo : Screen("sdg_info")
+    data object Community : Screen("community")
 }
 
 @Composable
-fun HealthApp(factory: ViewModelProvider.Factory) {
-    val healthViewModel: HealthViewModel = viewModel(factory = factory)
+fun HealthApp(viewModel: HealthViewModel) {
+    val healthViewModel = viewModel
     val navController = rememberNavController()
 
     NavHost(
+
         navController = navController,
         startDestination = Screen.Dashboard.route
     ) {
         composable(Screen.Dashboard.route) { DashboardScreen(navController, healthViewModel) }
         composable(Screen.Input.route) { InputScreen(navController, healthViewModel) }
+        composable(Screen.Tips.route) { TipsScreen(navController, healthViewModel) }
         composable(Screen.Detail.route) { DetailScreen(navController, healthViewModel) }
+        composable(Screen.Me.route) { MeScreen(navController, healthViewModel) }
         composable(Screen.History.route) { HistoryScreen(navController, healthViewModel) }
-        composable(Screen.SdgInfo.route) { SdgInfoScreen(navController) }
+        composable(Screen.Community.route) { CommunityScreen(navController, healthViewModel) }
     }
 }
 
@@ -170,6 +363,12 @@ fun HealthApp(factory: ViewModelProvider.Factory) {
 @Composable
 fun DashboardScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
     val uiState = healthViewModel.uiState.value
+
+    // 👈 修复点：动态感知系统当前的导航栈顶路由
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route
+
+
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -335,12 +534,12 @@ fun DashboardScreen(navController: NavHostController, healthViewModel: HealthVie
             Spacer(modifier = Modifier.height(12.dp))
 
             Button(
-                onClick = { navController.navigate(Screen.SdgInfo.route) },
+                onClick = { navController.navigate(Screen.Community.route) },
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
             ) {
-                Text("About SDG 3 (Health & Well-being)")
+                Text("Community Tips")
             }
             Spacer(modifier = Modifier.height(32.dp))
         }
@@ -353,9 +552,184 @@ fun DashboardScreen(navController: NavHostController, healthViewModel: HealthVie
                 .padding(vertical = 12.dp),
             horizontalArrangement = Arrangement.SpaceAround
         ) {
-            BottomNavIcon("Dashboard", R.drawable.menu1, true)
-            BottomNavIcon("Input", R.drawable.menu2, false)
-            BottomNavIcon("Details", R.drawable.menu3, false)
+            BottomNavIcon(
+                label = "Dashboard",
+                imageResId = R.drawable.menu1,
+                isSelected = currentRoute == Screen.Dashboard.route,
+                onClick = { navController.navigate(Screen.Dashboard.route) {
+                    popUpTo(Screen.Dashboard.route) { inclusive = true }
+                } }
+            )
+            BottomNavIcon(
+                label = "Tips",
+                imageResId = R.drawable.menu2,
+                isSelected = currentRoute == Screen.Tips.route,
+                onClick = { navController.navigate(Screen.Tips.route) }
+            )
+            BottomNavIcon(
+                label = "Me",
+                imageResId = R.drawable.menu3,
+                isSelected = currentRoute == Screen.Me.route,
+                onClick = { navController.navigate(Screen.Me.route) }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MeScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
+    val uiState = healthViewModel.uiState.value
+    val bmi = uiState.weightKg / ((uiState.heightCm / 100f) * (uiState.heightCm / 100f))
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Me") },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.face),
+                contentDescription = "WANGBINYU profile photo",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .size(128.dp)
+                    .shadow(8.dp, CircleShape)
+                    .clip(CircleShape)
+            )
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            Text(
+                text = uiState.userName,
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.ExtraBold,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            Text(
+                text = "Health Profile",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Box(modifier = Modifier.weight(1f)) {
+                    ProfileMetricCard("Age", "${uiState.age}", "years")
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    ProfileMetricCard("Height", "${uiState.heightCm}", "cm")
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    ProfileMetricCard("Weight", "${uiState.weightKg}", "kg")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+            ) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        text = "Body Overview",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    SummaryRow("BMI", String.format(Locale.US, "%.1f", bmi))
+                    SummaryRow("Daily Water Goal", "${uiState.dailyGoal} ml")
+                    SummaryRow("Today Water", "${uiState.waterIntake} ml")
+                    SummaryRow("Resting Heart Rate", "${uiState.heartRate} bpm")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+            ) {
+                Text(
+                    text = "Focus for today: stay hydrated, keep moving, and protect your recovery time.",
+                    modifier = Modifier.padding(20.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = Color(0xFF1B5E20),
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                onClick = { navController.navigate(Screen.Dashboard.route) },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text("Back to Dashboard")
+            }
+        }
+    }
+}
+
+@Composable
+fun TipsScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = healthViewModel.healthTip,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+                Button(
+                    onClick = { healthViewModel.refreshHealthTip() },
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Text("Refresh")
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = { navController.popBackStack() },
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
+                ) {
+                    Text("Back")
+                }
+            }
         }
     }
 }
@@ -366,6 +740,9 @@ fun InputScreen(navController: NavHostController, healthViewModel: HealthViewMod
     val uiState = healthViewModel.uiState.value
     var name by remember { mutableStateOf(uiState.userName) }
     var studentId by remember { mutableStateOf(uiState.studentId) }
+    var ageText by remember { mutableStateOf(uiState.age.toString()) }
+    var heightText by remember { mutableStateOf(uiState.heightCm.toString()) }
+    var weightText by remember { mutableStateOf(uiState.weightKg.toString()) }
     var goalText by remember { mutableStateOf(uiState.dailyGoal.toString()) }
     var waterText by remember { mutableStateOf("") }
 
@@ -395,6 +772,24 @@ fun InputScreen(navController: NavHostController, healthViewModel: HealthViewMod
             )
             Spacer(modifier = Modifier.height(16.dp))
             OutlinedTextField(
+                value = ageText, onValueChange = { ageText = it }, label = { Text("Age") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(), singleLine = true
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedTextField(
+                value = heightText, onValueChange = { heightText = it }, label = { Text("Height (cm)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(), singleLine = true
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedTextField(
+                value = weightText, onValueChange = { weightText = it }, label = { Text("Weight (kg)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(), singleLine = true
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            OutlinedTextField(
                 value = goalText, onValueChange = { goalText = it }, label = { Text("Daily Water Goal (ml)") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 modifier = Modifier.fillMaxWidth(), singleLine = true
@@ -409,15 +804,26 @@ fun InputScreen(navController: NavHostController, healthViewModel: HealthViewMod
 
             Button(
                 onClick = {
+                    val age = ageText.toIntOrNull() ?: uiState.age
+                    val height = heightText.toIntOrNull() ?: uiState.heightCm
+                    val weight = weightText.toIntOrNull() ?: uiState.weightKg
                     val goal = goalText.toIntOrNull() ?: uiState.dailyGoal
                     val water = waterText.toIntOrNull() ?: 0
-                    healthViewModel.updateProfile(name, studentId, goal)
+                    healthViewModel.updateProfile(name, studentId, age, height, weight, goal)
                     healthViewModel.addWater(water)
                     navController.navigate(Screen.Detail.route)
                 },
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
             ) {
                 Text("Save and Continue")
+            }
+            healthViewModel.errorMessage?.let {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = it,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
             Spacer(modifier = Modifier.height(12.dp))
             Button(
@@ -489,7 +895,13 @@ fun DetailScreen(navController: NavHostController, healthViewModel: HealthViewMo
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
-    val historyList by healthViewModel.waterHistory.collectAsState(initial = emptyList())
+    val localHistory by healthViewModel.waterHistory.collectAsState(initial = emptyList())
+    val serverItems = healthViewModel.serverHistory
+    val isLoading = healthViewModel.isHistoryLoading
+
+    LaunchedEffect(Unit) {
+        healthViewModel.loadWaterHistoryFromServer()
+    }
 
     Scaffold(
         topBar = {
@@ -505,7 +917,19 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
                 .padding(innerPadding)
                 .padding(24.dp)
         ) {
-            if (historyList.isEmpty()) {
+            if (isLoading) {
+                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+
+            val displayList = if (serverItems.isNotEmpty()) {
+                serverItems.map { "${it.amountMl} ml - ${it.note ?: ""}  (${it.createdAt?.take(16) ?: ""})" }
+            } else {
+                localHistory.map { it.logMessage }
+            }
+
+            if (displayList.isEmpty()) {
                 Text(
                     text = "No water intake recorded yet.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -513,7 +937,7 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
                 )
             } else {
                 LazyColumn(modifier = Modifier.weight(1f)) {
-                    items(historyList) { record ->
+                    items(displayList) { text ->
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -521,7 +945,7 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
                         ) {
                             Text(
-                                text = "💧 ${record.logMessage}",
+                                text = "💧 $text",
                                 modifier = Modifier.padding(16.dp),
                                 fontWeight = FontWeight.Medium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -530,7 +954,15 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+            Button(
+                onClick = { healthViewModel.loadWaterHistoryFromServer() },
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+                enabled = !isLoading
+            ) {
+                Text(if (isLoading) "Loading..." else "Refresh from Server")
+            }
+            Spacer(modifier = Modifier.height(8.dp))
             Button(
                 onClick = { navController.popBackStack() },
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
@@ -543,12 +975,17 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SdgInfoScreen(navController: NavHostController) {
+fun CommunityScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
+    val posts = healthViewModel.communityPosts
+    val isPosting = healthViewModel.isPosting
+    val uiState = healthViewModel.uiState.value
+    var inputText by remember { mutableStateOf("") }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("SDG 3 Impact") },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFFC8E6C9))
+                title = { Text("Community") },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)
             )
         }
     ) { innerPadding ->
@@ -557,33 +994,88 @@ fun SdgInfoScreen(navController: NavHostController) {
                 .fillMaxSize()
                 .padding(innerPadding)
                 .padding(24.dp)
-                .verticalScroll(rememberScrollState())
         ) {
-            Text(text = "Sustainable Development Goal 3", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(text = "Good Health and Well-being", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(text = "Ensure healthy lives and promote well-being for all at all ages.", style = MaterialTheme.typography.bodyLarge)
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text(text = "App Impact Statement:", fontWeight = FontWeight.Bold, color = Color(0xFF1B5E20))
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(text = "Proper hydration and health metric tracking can significantly prevent illnesses, improve daily energy levels, and encourage a healthier community lifestyle.", color = Color(0xFF2E7D32))
+            if (posts.isEmpty()) {
+                Text(
+                    text = "No community posts yet.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(16.dp)
+                )
+            } else {
+                LazyColumn(modifier = Modifier.weight(1f)) {
+                    items(posts) { post ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 8.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            shape = RoundedCornerShape(16.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text(
+                                    text = post.tipText,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = post.studentId,
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = "- ${post.source}",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            Spacer(modifier = Modifier.weight(1f))
+
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = inputText,
+                    onValueChange = { inputText = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Share a tip...") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        if (inputText.isNotBlank()) {
+                            healthViewModel.addCommunityPost(
+                                studentId = uiState.studentId,
+                                tipText = inputText.trim(),
+                                source = uiState.userName
+                            )
+                            inputText = ""
+                        }
+                    },
+                    enabled = inputText.isNotBlank() && !isPosting,
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(if (isPosting) "..." else "Post")
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
             Button(
                 onClick = { navController.popBackStack() },
-                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp)
             ) {
-                Text("Back to Dashboard")
+                Text("Back")
             }
         }
     }
@@ -665,8 +1157,68 @@ fun SummaryCard(label: String, value: String) {
 }
 
 @Composable
-fun BottomNavIcon(label: String, imageResId: Int, isSelected: Boolean) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+fun ProfileMetricCard(label: String, value: String, unit: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 16.dp, horizontal = 8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = value,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.ExtraBold,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                text = unit,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+fun SummaryRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSecondaryContainer
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSecondaryContainer
+        )
+    }
+}
+
+@Composable
+fun BottomNavIcon(label: String, imageResId: Int, isSelected: Boolean, onClick: () -> Unit) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.clickable { onClick() } // 👈 修复点：让图标变得可以点击
+    ) {
         Image(
             painter = painterResource(id = imageResId),
             contentDescription = label,
