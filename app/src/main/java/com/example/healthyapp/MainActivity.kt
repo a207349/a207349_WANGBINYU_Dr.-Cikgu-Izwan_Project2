@@ -58,6 +58,7 @@ import com.example.healthyapp.data.WaterRecord
 import com.example.healthyapp.data.WaterDao
 import com.example.healthyapp.data.HealthDatabase
 import com.example.healthyapp.data.HealthRepository
+// 🔥 Firebase Firestore 社区数据
 import com.example.healthyapp.firebase.CommunityPost
 import com.example.healthyapp.firebase.FirestoreService
 import com.example.healthyapp.network.HealthyApiClient
@@ -124,6 +125,7 @@ class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
         }
     }
 
+    // 🔥 Firestore：实时监听社区帖子
     private val firestoreService = FirestoreService()
     private var firestoreListener: com.google.firebase.firestore.ListenerRegistration? = null
 
@@ -133,11 +135,13 @@ class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
         private set
 
     init {
+        // 🔥 Firestore：启动实时监听，自动更新 communityPosts
         firestoreListener = firestoreService.listenPosts { posts ->
             communityPosts = posts
         }
     }
 
+    // 🔥 Firestore：发布新帖子
     fun addCommunityPost(studentId: String, tipText: String, source: String) {
         viewModelScope.launch {
             isPosting = true
@@ -150,6 +154,7 @@ class HealthViewModel(private val repository: HealthRepository) : ViewModel() {
         }
     }
 
+    // 🔥 Firestore：页面销毁时移除监听器
     override fun onCleared() {
         super.onCleared()
         firestoreListener?.remove()
@@ -267,7 +272,9 @@ class HealthViewModelFactory(private val repository: HealthRepository) : ViewMod
 // ==========================================
 // MainActivity (主 Activity 入口)
 // ==========================================
+// 📱 传感器：摇一摇功能 ——————————————————————————
 class MainActivity : ComponentActivity(), SensorEventListener {
+    // 📱 传感器：加速度计相关
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
     private var lastShakeTime = 0L
@@ -277,6 +284,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 📱 传感器：获取系统加速度计
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
@@ -297,6 +305,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    // 📱 传感器：页面可见时开始监听
     override fun onResume() {
         super.onResume()
         accelerometer?.also { accel ->
@@ -304,6 +313,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 
+    // 📱 传感器：页面不可见时停止监听
     override fun onPause() {
         super.onPause()
         sensorManager.unregisterListener(this)
@@ -311,12 +321,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    // 📱 传感器：摇动检测算法
     override fun onSensorChanged(event: SensorEvent?) {
         event ?: return
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
         val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+        // 📱 传感器：加速度 > 重力+15 且 2 秒防抖 → 加 100ml 水
         if (magnitude > SensorManager.GRAVITY_EARTH + 15f) {
             val now = System.currentTimeMillis()
             if (now - lastShakeTime > 2000) {
@@ -326,6 +338,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
     }
 }
+// ————————————————————————————————————————————
 
 sealed class Screen(val route: String) {
     data object Dashboard : Screen("dashboard")
@@ -973,6 +986,7 @@ fun HistoryScreen(navController: NavHostController, healthViewModel: HealthViewM
     }
 }
 
+// 🔥 Firestore：社区帖子列表（实时同步）
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CommunityScreen(navController: NavHostController, healthViewModel: HealthViewModel) {
@@ -995,6 +1009,7 @@ fun CommunityScreen(navController: NavHostController, healthViewModel: HealthVie
                 .padding(innerPadding)
                 .padding(24.dp)
         ) {
+            // 🔥 Firestore：实时数据自动刷新，无需手动加载
             if (posts.isEmpty()) {
                 Text(
                     text = "No community posts yet.",
@@ -1039,35 +1054,48 @@ fun CommunityScreen(navController: NavHostController, healthViewModel: HealthVie
                 }
             }
 
+            // 🔥 Firestore：输入并提交新帖子（全宽提交按钮）
             Spacer(modifier = Modifier.height(12.dp))
-            Row(
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Share a tip...") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
                 )
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(
-                    onClick = {
-                        if (inputText.isNotBlank()) {
-                            healthViewModel.addCommunityPost(
-                                studentId = uiState.studentId,
-                                tipText = inputText.trim(),
-                                source = uiState.userName
-                            )
-                            inputText = ""
-                        }
-                    },
-                    enabled = inputText.isNotBlank() && !isPosting,
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text(if (isPosting) "..." else "Post")
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("Share a health tip...") },
+                        minLines = 2,
+                        maxLines = 4,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = {
+                            if (inputText.isNotBlank()) {
+                                // 🔥 Firestore：写入 Firestore 集合 community_posts
+                                healthViewModel.addCommunityPost(
+                                    studentId = uiState.studentId,
+                                    tipText = inputText.trim(),
+                                    source = uiState.userName
+                                )
+                                inputText = ""
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        enabled = inputText.isNotBlank() && !isPosting,
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = if (isPosting) "Posting..." else "Share to Community",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(8.dp))
